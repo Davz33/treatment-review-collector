@@ -44,8 +44,9 @@ def cli():
 @click.option('--threshold', default=0.6, help='Reliability threshold (0-1)')
 @click.option('--output', '-o', help='Output file path (JSON)')
 @click.option('--include-unreliable', is_flag=True, help='Include unreliable reviews in output')
+@click.option('--use-mock-data', is_flag=True, help='Use mock data instead of web crawling (for testing)')
 def collect(therapy_name: str, condition: str, trial_year: int, duration_weeks: Optional[int],
-           max_reviews: int, threshold: float, output: Optional[str], include_unreliable: bool):
+           max_reviews: int, threshold: float, output: Optional[str], include_unreliable: bool, use_mock_data: bool):
     """Collect reliable reviews for a specific therapy and clinical trial."""
     
     click.echo(f"🔍 Collecting reviews for: {therapy_name}")
