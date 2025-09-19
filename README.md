@@ -35,12 +35,31 @@ When researching medical treatments, especially those from older clinical trials
 git clone https://github.com/Davz33/treatment-review-collector.git
 cd treatment-review-collector
 
-# Install dependencies
+# Create virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install core dependencies
+pip install requests beautifulsoup4 lxml click
+
+# Or install all dependencies
 pip install -r requirements.txt
 
 # Optional: Install advanced AI detection models
 pip install torch transformers sentence-transformers
 ```
+
+### ⚠️ Common Issue: 403 Forbidden Errors
+
+If you encounter 403 errors when crawling websites:
+
+1. **This is normal** - many medical sites block automated requests
+2. **The system handles this** - it tries multiple sources automatically
+3. **See [TROUBLESHOOTING.md](TROUBLESHOOTING.md)** for detailed solutions
+4. **Test core functionality** without web crawling:
+   ```bash
+   python3 test_without_deps.py  # Works without external dependencies
+   ```
 
 ### Basic Usage
 

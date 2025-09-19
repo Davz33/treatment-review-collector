@@ -98,9 +98,37 @@ class ReviewCrawler:
         """Make HTTP request with rate limiting and error handling"""
         try:
             time.sleep(self.delay)
-            response = self.session.get(url, timeout=10, **kwargs)
+            
+            # Add additional headers to appear more like a real browser
+            headers = kwargs.get('headers', {})
+            headers.update({
+                'Referer': 'https://www.google.com/',
+                'DNT': '1',
+                'Cache-Control': 'max-age=0',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'cross-site',
+                'Sec-Fetch-User': '?1'
+            })
+            kwargs['headers'] = headers
+            
+            response = self.session.get(url, timeout=15, **kwargs)
+            
+            # Handle different response codes
+            if response.status_code == 403:
+                logger.warning(f"Access forbidden for {url}. This site may block automated requests.")
+                return None
+            elif response.status_code == 429:
+                logger.warning(f"Rate limited for {url}. Waiting longer...")
+                time.sleep(5)
+                return None
+            elif response.status_code != 200:
+                logger.warning(f"Unexpected status {response.status_code} for {url}")
+                return None
+                
             response.raise_for_status()
             return response
+            
         except requests.RequestException as e:
             logger.error(f"Request failed for {url}: {e}")
             return None
@@ -159,63 +187,274 @@ class ReviewCrawler:
         return "unknown"
     
     def crawl_drugs_com(self, drug_name: str, max_pages: int = 5) -> Generator[ReviewData, None, None]:
-        """Crawl reviews from Drugs.com"""
-        base_url = f"https://www.drugs.com/comments/{drug_name.replace(' ', '-').lower()}/"
+        """
+        Crawl reviews from Drugs.com
+        Note: This site often blocks automated requests. Consider using their API or other sources.
+        """
+        # Try different URL patterns for therapy names
+        search_terms = [
+            drug_name.replace(' ', '-').lower(),
+            drug_name.replace(' ', '_').lower(),
+            drug_name.lower().replace(' ', '')
+        ]
         
-        for page in range(1, max_pages + 1):
-            url = f"{base_url}?page={page}" if page > 1 else base_url
-            response = self._make_request(url)
+        for search_term in search_terms:
+            base_url = f"https://www.drugs.com/comments/{search_term}/"
             
+            # Try the first page to see if this URL pattern works
+            response = self._make_request(base_url)
             if not response:
                 continue
                 
+            # If we got a response, try to extract reviews
             soup = BeautifulSoup(response.content, 'html.parser')
-            reviews = soup.find_all('div', class_='review')
             
-            if not reviews:
-                logger.info(f"No more reviews found on page {page}")
-                break
+            # Check if this is a valid review page
+            if "no comments" in soup.get_text().lower() or not soup.find('div', class_='review'):
+                continue
             
-            for review_elem in reviews:
+            # Process pages for this working URL pattern
+            for page in range(1, max_pages + 1):
+                url = f"{base_url}?page={page}" if page > 1 else base_url
+                if page > 1:  # We already have the first page response
+                    response = self._make_request(url)
+                    if not response:
+                        break
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                
+                reviews = soup.find_all('div', class_='review')
+                
+                if not reviews:
+                    logger.info(f"No reviews found on page {page} for {search_term}")
+                    break
+                
+                for review_elem in reviews:
+                    try:
+                        # Extract review text
+                        text_elem = review_elem.find('div', class_='review-content')
+                        if not text_elem:
+                            continue
+                        
+                        review_text = text_elem.get_text(strip=True)
+                        
+                        # Skip very short reviews
+                        if len(review_text) < 20:
+                            continue
+                        
+                        # Extract metadata
+                        date_elem = review_elem.find('span', class_='review-date')
+                        date_str = date_elem.get_text(strip=True) if date_elem else ""
+                        review_date = self._extract_date(date_str) or datetime.now()
+                        
+                        user_elem = review_elem.find('span', class_='review-author')
+                        user_id = user_elem.get_text(strip=True) if user_elem else "anonymous"
+                        
+                        # Create metadata
+                        metadata = ReviewMetadata(
+                            source_url=url,
+                            date_posted=review_date,
+                            user_id=user_id,
+                            platform="drugs.com",
+                            review_length=len(review_text),
+                            language_detected="en"
+                        )
+                        
+                        yield ReviewData(
+                            text=review_text,
+                            metadata=metadata,
+                            raw_data={
+                                'platform': 'drugs.com',
+                                'drug_name': drug_name,
+                                'page': page,
+                                'search_term': search_term
+                            }
+                        )
+                        
+                    except Exception as e:
+                        logger.error(f"Error parsing review: {e}")
+                        continue
+            
+            # If we found reviews with this URL pattern, don't try others
+            return
+        
+        logger.warning(f"No accessible review pages found for '{drug_name}' on drugs.com")
+    
+    def crawl_pubmed_comments(self, therapy_name: str, condition: str) -> Generator[ReviewData, None, None]:
+        """
+        Search PubMed for patient experience studies and extract relevant findings.
+        This provides more academic but still patient-focused content.
+        """
+        try:
+            # PubMed search for patient experiences, case studies, and qualitative research
+            search_terms = [
+                f'"{therapy_name}" "{condition}" patient experience',
+                f'"{therapy_name}" "{condition}" qualitative study',
+                f'"{therapy_name}" "{condition}" case report',
+                f'"{therapy_name}" patient perspective',
+            ]
+            
+            base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+            
+            for search_term in search_terms:
+                # Search PubMed
+                search_url = f"{base_url}esearch.fcgi"
+                search_params = {
+                    'db': 'pubmed',
+                    'term': search_term,
+                    'retmax': 10,
+                    'retmode': 'json'
+                }
+                
+                response = self._make_request(search_url, params=search_params)
+                if not response:
+                    continue
+                
                 try:
-                    # Extract review text
-                    text_elem = review_elem.find('div', class_='review-content')
-                    if not text_elem:
+                    search_data = response.json()
+                    pmids = search_data.get('esearchresult', {}).get('idlist', [])
+                    
+                    if not pmids:
                         continue
                     
-                    review_text = text_elem.get_text(strip=True)
+                    # Fetch abstracts
+                    fetch_url = f"{base_url}efetch.fcgi"
+                    fetch_params = {
+                        'db': 'pubmed',
+                        'id': ','.join(pmids[:5]),  # Limit to first 5
+                        'retmode': 'xml'
+                    }
                     
-                    # Extract metadata
-                    date_elem = review_elem.find('span', class_='review-date')
-                    date_str = date_elem.get_text(strip=True) if date_elem else ""
-                    review_date = self._extract_date(date_str) or datetime.now()
+                    response = self._make_request(fetch_url, params=fetch_params)
+                    if not response:
+                        continue
                     
-                    user_elem = review_elem.find('span', class_='review-author')
-                    user_id = user_elem.get_text(strip=True) if user_elem else "anonymous"
+                    # Parse XML and extract relevant content
+                    soup = BeautifulSoup(response.content, 'xml')
+                    articles = soup.find_all('PubmedArticle')
                     
-                    # Create metadata
+                    for article in articles:
+                        try:
+                            # Extract abstract
+                            abstract_elem = article.find('Abstract')
+                            if not abstract_elem:
+                                continue
+                            
+                            abstract_text = abstract_elem.get_text(strip=True)
+                            
+                            # Only include if it mentions patient experiences or outcomes
+                            if not any(keyword in abstract_text.lower() for keyword in 
+                                     ['patient', 'experience', 'reported', 'outcome', 'improvement', 'treatment']):
+                                continue
+                            
+                            # Extract publication date
+                            pub_date_elem = article.find('PubDate')
+                            pub_year = 2020  # Default
+                            if pub_date_elem:
+                                year_elem = pub_date_elem.find('Year')
+                                if year_elem:
+                                    pub_year = int(year_elem.get_text())
+                            
+                            # Extract title
+                            title_elem = article.find('ArticleTitle')
+                            title = title_elem.get_text(strip=True) if title_elem else "Unknown"
+                            
+                            # Extract PMID
+                            pmid_elem = article.find('PMID')
+                            pmid = pmid_elem.get_text() if pmid_elem else "unknown"
+                            
+                            metadata = ReviewMetadata(
+                                source_url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                                date_posted=datetime(pub_year, 1, 1),
+                                platform="pubmed",
+                                review_length=len(abstract_text),
+                                language_detected="en"
+                            )
+                            
+                            yield ReviewData(
+                                text=f"Study: {title}\n\nFindings: {abstract_text}",
+                                metadata=metadata,
+                                raw_data={
+                                    'platform': 'pubmed',
+                                    'pmid': pmid,
+                                    'title': title,
+                                    'search_term': search_term
+                                }
+                            )
+                            
+                        except Exception as e:
+                            logger.error(f"Error parsing PubMed article: {e}")
+                            continue
+                            
+                except Exception as e:
+                    logger.error(f"Error parsing PubMed search results: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error searching PubMed: {e}")
+    
+    def crawl_healthline_community(self, therapy_name: str, condition: str) -> Generator[ReviewData, None, None]:
+        """
+        Crawl Healthline community discussions for patient experiences.
+        Healthline is generally more accessible than drugs.com.
+        """
+        try:
+            # Search Healthline community
+            search_query = f"{therapy_name} {condition}".replace(' ', '+')
+            search_url = f"https://www.healthline.com/search?q={search_query}"
+            
+            response = self._make_request(search_url)
+            if not response:
+                return
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Look for community posts or articles with patient experiences
+            article_links = soup.find_all('a', href=True)
+            community_links = [link['href'] for link in article_links 
+                             if 'community' in link['href'] or 'forum' in link['href']]
+            
+            for link in community_links[:5]:  # Limit to first 5 links
+                if not link.startswith('http'):
+                    link = f"https://www.healthline.com{link}"
+                
+                response = self._make_request(link)
+                if not response:
+                    continue
+                
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Extract discussion content
+                content_areas = soup.find_all(['div', 'article'], class_=lambda x: x and 
+                                            any(term in str(x).lower() for term in ['content', 'post', 'comment', 'discussion']))
+                
+                for content_area in content_areas:
+                    text = content_area.get_text(strip=True)
+                    
+                    # Filter for relevant content
+                    if (len(text) < 50 or len(text) > 2000 or 
+                        not any(keyword in text.lower() for keyword in [therapy_name.lower(), condition.lower()])):
+                        continue
+                    
                     metadata = ReviewMetadata(
-                        source_url=url,
-                        date_posted=review_date,
-                        user_id=user_id,
-                        platform="drugs.com",
-                        review_length=len(review_text),
+                        source_url=link,
+                        date_posted=datetime.now(),  # Would need better date extraction
+                        platform="healthline",
+                        review_length=len(text),
                         language_detected="en"
                     )
                     
                     yield ReviewData(
-                        text=review_text,
+                        text=text,
                         metadata=metadata,
                         raw_data={
-                            'platform': 'drugs.com',
-                            'drug_name': drug_name,
-                            'page': page
+                            'platform': 'healthline',
+                            'therapy_name': therapy_name,
+                            'condition': condition
                         }
                     )
                     
-                except Exception as e:
-                    logger.error(f"Error parsing review: {e}")
-                    continue
+        except Exception as e:
+            logger.error(f"Error crawling Healthline: {e}")
     
     def crawl_reddit_medical(self, subreddit: str, query: str, max_posts: int = 50) -> Generator[ReviewData, None, None]:
         """
@@ -525,20 +764,26 @@ class ReliableReviewCollector:
     
     def collect_reliable_reviews(self, therapy_name: str, max_reviews: int = 100) -> List[Dict[str, Any]]:
         """
-        Collect and filter reliable reviews for a specific therapy.
-        Falls back to mock data if web crawling fails.
+        Collect and filter reliable reviews for a specific therapy from multiple sources.
         """
         reliable_reviews = []
         total_collected = 0
-        crawling_successful = False
         
-        # Search multiple sources
+        # Get clinical trial criteria for better source selection
+        condition = getattr(self.detector.clinical_trial, 'condition_treated', '')
+        
+        # Search multiple sources with better accessibility
         sources = [
-            ('drugs.com', lambda: self.crawler.crawl_drugs_com(therapy_name, max_pages=5)),
-            ('reddit', lambda: self.crawler.crawl_reddit_medical('ChronicPain', therapy_name, max_posts=20)),
+            ('pubmed', lambda: self.crawler.crawl_pubmed_comments(therapy_name, condition)),
+            ('healthline', lambda: self.crawler.crawl_healthline_community(therapy_name, condition)),
+            ('drugs.com', lambda: self.crawler.crawl_drugs_com(therapy_name, max_pages=3)),
+            ('clinicaltrials', lambda: self.crawler.crawl_clinicaltrials_gov(therapy_name, condition)),
         ]
         
         for source_name, source_func in sources:
+            if total_collected >= max_reviews:
+                break
+                
             logger.info(f"Collecting reviews from {source_name}...")
             
             try:
@@ -563,52 +808,34 @@ class ReliableReviewCollector:
                         'raw_data': review_data.raw_data
                     }
                     
-                    if is_reliable:
-                        reliable_reviews.append(review_result)
-                        logger.info(f"Found reliable review (score: {score.overall_score:.3f})")
-                    
+                    # Always add to total count for processing stats
                     total_collected += 1
                     source_reviews += 1
+                    
+                    if is_reliable:
+                        reliable_reviews.append(review_result)
+                        logger.info(f"Found reliable review from {source_name} (score: {score.overall_score:.3f})")
                 
                 if source_reviews > 0:
-                    crawling_successful = True
+                    logger.info(f"Processed {source_reviews} reviews from {source_name}")
+                else:
+                    logger.info(f"No reviews found from {source_name}")
                     
             except Exception as e:
                 logger.error(f"Error collecting from {source_name}: {e}")
         
-        # If web crawling failed or returned no results, use mock data for demonstration
-        if not crawling_successful or total_collected == 0:
-            logger.warning("Web crawling failed or returned no results. Using mock data for demonstration.")
-            logger.info("Note: In production, you would configure proper API access or use different sources.")
-            
-            mock_count = min(max_reviews, 50)  # Generate reasonable amount of mock data
-            logger.info(f"Generating {mock_count} mock reviews for demonstration...")
-            
-            for review_data in self.mock_generator.generate_realistic_reviews(mock_count):
-                if total_collected >= max_reviews:
-                    break
-                
-                # Check reliability
-                is_reliable, score = self.detector.is_reliable_review(
-                    review_data.text, 
-                    review_data.metadata, 
-                    self.threshold
-                )
-                
-                review_result = {
-                    'text': review_data.text,
-                    'metadata': review_data.metadata.__dict__,
-                    'reliability_score': score.to_dict(),
-                    'is_reliable': is_reliable,
-                    'source': 'mock_data',
-                    'raw_data': review_data.raw_data
-                }
-                
-                if is_reliable:
-                    reliable_reviews.append(review_result)
-                    logger.info(f"Found reliable mock review (score: {score.overall_score:.3f})")
-                
-                total_collected += 1
+        if total_collected == 0:
+            logger.warning("No reviews were collected from any source.")
+            logger.info("This could be due to:")
+            logger.info("- Network connectivity issues")
+            logger.info("- Website blocking automated requests")
+            logger.info("- No matching content available")
+            logger.info("- Incorrect therapy/condition names")
+            logger.info("\nSuggestions:")
+            logger.info("- Check your internet connection")
+            logger.info("- Try different therapy name variations")
+            logger.info("- Use more specific condition terms")
+            logger.info("- Consider using API access for better results")
         
         logger.info(f"Collected {len(reliable_reviews)} reliable reviews out of {total_collected} total")
         return reliable_reviews
